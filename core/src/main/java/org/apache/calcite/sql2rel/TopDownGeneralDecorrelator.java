@@ -17,6 +17,7 @@
 package org.apache.calcite.sql2rel;
 
 import org.apache.calcite.linq4j.function.Experimental;
+import org.apache.calcite.plan.PlanTooComplexError;
 import org.apache.calcite.plan.RelOptCostImpl;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.Strong;
@@ -36,6 +37,7 @@ import org.apache.calcite.rel.core.SetOp;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexCorrelVariable;
 import org.apache.calcite.rex.RexFieldAccess;
@@ -311,8 +313,8 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
     //               D   R
     builder.push(newLeft).push(newRight);
     RexNode unnestedJoinCondition =
-        UnnestedQuery.createUnnestedJoinCondition(correlate.getCondition(), leftInfo, rightInfo,
-            true, builder, corDefs);
+        UnnestedQuery.createUnnestedJoinCondition(correlate.getCondition(), correlate.getJoinType(),
+            leftInfo, rightInfo, true, builder, corDefs);
     RelNode unnestedRel = builder.join(correlate.getJoinType(), unnestedJoinCondition).build();
 
     if (!hasParent) {
@@ -324,7 +326,9 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
               rightInfo,
               correlate,
               unnestedRel,
-              correlate.getJoinType());
+              correlate.getJoinType(),
+              builder,
+              corDefs);
       List<RexNode> projects
           = builder.fields(new ArrayList<>(unnestedQuery.oldToNewOutputs.values()));
       unnestedRel = builder.project(projects).build();
@@ -670,7 +674,7 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
         = requireNonNull(subDecorrelator.mapRelToUnnestedQuery.get(correlate.getRight()));
     UnnestedQuery unnestedQuery =
         UnnestedQuery.createJoinUnnestInfo(leftInfo, rightInfo, correlate,
-            newJoin, correlate.getJoinType());
+            newJoin, correlate.getJoinType(), builder, corDefs);
     mapRelToUnnestedQuery.put(correlate, unnestedQuery);
     return newJoin;
   }
@@ -738,6 +742,7 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
     RexNode newJoinCondition =
         UnnestedQuery.createUnnestedJoinCondition(
             join.getCondition(),
+            join.getJoinType(),
             leftInfo,
             rightInfo,
             pushDownToLeft && pushDownToRight,
@@ -750,7 +755,9 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
             rightInfo,
             join,
             newJoin,
-            join.getJoinType());
+            join.getJoinType(),
+            builder,
+            corDefs);
     mapRelToUnnestedQuery.put(join, unnestedQuery);
     return newJoin;
   }
@@ -898,9 +905,21 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
    */
   static class CorrelatedExprRewriter extends RexShuttle {
     final UnnestedQuery unnestedQuery;
+    final boolean isFullJoinCondition;
+    final Map<CorDef, RexNode> corDefToCoalesce;
+
+
+    CorrelatedExprRewriter(
+        UnnestedQuery unnestedQuery,
+        boolean isFullJoinCondition,
+        Map<CorDef, RexNode> corDefToCoalesce) {
+      this.unnestedQuery = unnestedQuery;
+      this.isFullJoinCondition = isFullJoinCondition;
+      this.corDefToCoalesce = corDefToCoalesce;
+    }
 
     CorrelatedExprRewriter(UnnestedQuery unnestedQuery) {
-      this.unnestedQuery = unnestedQuery;
+      this(unnestedQuery, false, new HashMap<>());
     }
 
     static RexNode rewrite(
@@ -915,6 +934,16 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
         UnnestedQuery unnestedQuery) {
       CorrelatedExprRewriter rewriter = new CorrelatedExprRewriter(unnestedQuery);
       return new ArrayList<>(rewriter.apply(exprs));
+    }
+
+    static RexNode rewriteJoinCondition(
+        RexNode expr,
+        UnnestedQuery unnestedQuery,
+        boolean isFullJoinCondition,
+        Map<CorDef, RexNode> corDefToCoalesce) {
+      CorrelatedExprRewriter rewriter =
+          new CorrelatedExprRewriter(unnestedQuery, isFullJoinCondition, corDefToCoalesce);
+      return expr.accept(rewriter);
     }
 
     @Override public RexNode visitInputRef(RexInputRef inputRef) {
@@ -935,9 +964,13 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
         RexCorrelVariable v =
             (RexCorrelVariable) fieldAccess.getReferenceExpr();
         CorDef corDef = new CorDef(v.id, fieldAccess.getField().getIndex());
-        int newIndex = requireNonNull(unnestedQuery.corDefOutputs.get(corDef));
-        return new RexInputRef(
-            newIndex, unnestedQuery.r.getRowType().getFieldList().get(newIndex).getType());
+        if (isFullJoinCondition) {
+          return requireNonNull(corDefToCoalesce.get(corDef));
+        } else {
+          int newIndex = requireNonNull(unnestedQuery.corDefOutputs.get(corDef));
+          return new RexInputRef(
+              newIndex, unnestedQuery.r.getRowType().getFieldList().get(newIndex).getType());
+        }
       }
       return super.visitFieldAccess(fieldAccess);
     }
@@ -989,23 +1022,25 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
     /**
      * Create UnnestedQuery for Join/Correlate after decorrelating.
      *
-     * @param leftInfo          UnnestedQuery of the left side
-     * @param rightInfo         UnnestedQuery of the right side
+     * @param leftUnnestedQuery          UnnestedQuery of the left side
+     * @param rightUnnestedQuery         UnnestedQuery of the right side
      * @param oriJoinNode       original Join/Correlate node
      * @param unnestedJoinNode  new node after decorrelating
      * @param joinRelType       join type of original Join/Correlate
      * @return UnnestedQuery
      */
     private static UnnestedQuery createJoinUnnestInfo(
-        UnnestedQuery leftInfo,
-        UnnestedQuery rightInfo,
+        UnnestedQuery leftUnnestedQuery,
+        UnnestedQuery rightUnnestedQuery,
         RelNode oriJoinNode,
         RelNode unnestedJoinNode,
-        JoinRelType joinRelType) {
+        JoinRelType joinRelType,
+        RelBuilder builder,
+        NavigableSet<CorDef> corDefs) {
       Map<Integer, Integer> oldToNewOutputs = new HashMap<>();
-      oldToNewOutputs.putAll(leftInfo.oldToNewOutputs);
-      int oriLeftFieldCount = leftInfo.oldRel.getRowType().getFieldCount();
-      int newLeftFieldCount = leftInfo.r.getRowType().getFieldCount();
+      oldToNewOutputs.putAll(leftUnnestedQuery.oldToNewOutputs);
+      int oriLeftFieldCount = leftUnnestedQuery.oldRel.getRowType().getFieldCount();
+      int newLeftFieldCount = leftUnnestedQuery.r.getRowType().getFieldCount();
       switch (joinRelType) {
       case SEMI:
       case ANTI:
@@ -1014,7 +1049,7 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
         oldToNewOutputs.put(oriLeftFieldCount, newLeftFieldCount);
         break;
       default:
-        rightInfo.oldToNewOutputs.forEach((oriIndex, newIndex) ->
+        rightUnnestedQuery.oldToNewOutputs.forEach((oriIndex, newIndex) ->
             oldToNewOutputs.put(
                 requireNonNull(oriIndex, "oriIndex") + oriLeftFieldCount,
                 requireNonNull(newIndex, "newIndex") + newLeftFieldCount));
@@ -1022,16 +1057,42 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
       }
 
       TreeMap<CorDef, Integer> corDefOutputs = new TreeMap<>();
-      if (!leftInfo.corDefOutputs.isEmpty()) {
-        corDefOutputs.putAll(leftInfo.corDefOutputs);
-      } else if (!rightInfo.corDefOutputs.isEmpty()) {
-        Litmus.THROW.check(joinRelType.projectsRight(),
-            "If the joinType doesn't project right, its left side must have UnnestInfo.");
-        rightInfo.corDefOutputs.forEach((corDef, index) ->
+      switch (joinRelType) {
+      case SEMI:
+      case ANTI:
+      case LEFT_MARK:
+      case LEFT:
+        corDefOutputs.putAll(leftUnnestedQuery.corDefOutputs);
+        break;
+      case RIGHT:
+        rightUnnestedQuery.corDefOutputs.forEach((corDef, index) ->
             corDefOutputs.put(corDef, index + newLeftFieldCount));
-      } else {
-        throw new IllegalArgumentException("The UnnestInfo for both sides of Join/Correlate that "
-            + "has correlation should not all be empty.");
+        break;
+      case FULL:
+        builder.push(unnestedJoinNode);
+        List<RexNode> projects = new ArrayList<>(builder.fields());
+        for (CorDef corDef : corDefs) {
+          int leftIndex = requireNonNull(leftUnnestedQuery.corDefOutputs.get(corDef));
+          int rightIndex = requireNonNull(rightUnnestedQuery.corDefOutputs.get(corDef));
+          RexNode coalesce = builder.call(
+              SqlStdOperatorTable.COALESCE,
+              builder.field(leftIndex),
+              builder.field(rightIndex + newLeftFieldCount));
+          projects.add(coalesce);
+          corDefOutputs.put(corDef, projects.size() - 1);
+        }
+        unnestedJoinNode = builder.project(projects).build();
+        break;
+      case INNER:
+        if (!leftUnnestedQuery.corDefOutputs.isEmpty()) {
+          corDefOutputs.putAll(leftUnnestedQuery.corDefOutputs);
+        } else {
+          rightUnnestedQuery.corDefOutputs.forEach((corDef, index) ->
+              corDefOutputs.put(corDef, index + newLeftFieldCount));
+        }
+        break;
+      default:
+        throw new UnsupportedOperationException("Unsupported join type : " + joinRelType);
       }
       return new UnnestedQuery(oriJoinNode, unnestedJoinNode, corDefOutputs, oldToNewOutputs);
     }
@@ -1040,8 +1101,9 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
      * Create the new join condition after decorrelating.
      *
      * @param oriCondition              original Correlate/Join condition
-     * @param leftInfo                  UnnestedQuery of the left side
-     * @param rightInfo                 UnnestedQuery of the right side
+     * @param joinRelType               original join type
+     * @param leftUnnestedQuery                  UnnestedQuery of the left side
+     * @param rightUnnestedQuery                 UnnestedQuery of the right side
      * @param needNaturalJoinCondition  whether need to add the natural join condition for domain D
      * @param builder                   RelBuilder
      * @param corDefs                   the CorDef in the current decorrelator context
@@ -1049,53 +1111,84 @@ public class TopDownGeneralDecorrelator implements ReflectiveVisitor {
      */
     private static RexNode createUnnestedJoinCondition(
         RexNode oriCondition,
-        UnnestedQuery leftInfo,
-        UnnestedQuery rightInfo,
+        JoinRelType joinRelType,
+        UnnestedQuery leftUnnestedQuery,
+        UnnestedQuery rightUnnestedQuery,
         boolean needNaturalJoinCondition,
         RelBuilder builder,
         NavigableSet<CorDef> corDefs) {
-      // create a temporary inner join and its UnnestedQuery to help rewrite the
+      // create a temporary cross join and its UnnestedQuery to help rewrite the
       // original condition by CorrelatedExprRewriter
+      RelNode temporaryOldRel = builder.push(leftUnnestedQuery.oldRel).push(rightUnnestedQuery.oldRel)
+          .join(JoinRelType.INNER)
+          .build();
+      RelNode temporaryNewRel = builder.push(leftUnnestedQuery.r).push(rightUnnestedQuery.r)
+          .join(JoinRelType.INNER)
+          .build();
+
       Map<Integer, Integer> temporaryOldToNewOutputs = new HashMap<>();
-      int oriLeftFieldCount = leftInfo.oldRel.getRowType().getFieldCount();
-      int newLeftFieldCount = leftInfo.r.getRowType().getFieldCount();
-      temporaryOldToNewOutputs.putAll(leftInfo.oldToNewOutputs);
-      rightInfo.oldToNewOutputs.forEach((oriIndex, newIndex) ->
+      int oriLeftFieldCount = leftUnnestedQuery.oldRel.getRowType().getFieldCount();
+      int newLeftFieldCount = leftUnnestedQuery.r.getRowType().getFieldCount();
+      temporaryOldToNewOutputs.putAll(leftUnnestedQuery.oldToNewOutputs);
+      rightUnnestedQuery.oldToNewOutputs.forEach((oriIndex, newIndex) ->
           temporaryOldToNewOutputs.put(
               requireNonNull(oriIndex, "oriIndex") + oriLeftFieldCount,
               requireNonNull(newIndex, "newIndex") + newLeftFieldCount));
 
       TreeMap<CorDef, Integer> temporaryCorDefOutputs = new TreeMap<>();
-      if (!leftInfo.corDefOutputs.isEmpty()) {
-        temporaryCorDefOutputs.putAll(leftInfo.corDefOutputs);
-      } else if (!rightInfo.corDefOutputs.isEmpty()) {
-        rightInfo.corDefOutputs.forEach((corDef, index) ->
+      Map<CorDef, RexNode> temporaryCorDefToCoalesce = new HashMap<>();
+      switch (joinRelType) {
+      case SEMI:
+      case ANTI:
+      case LEFT_MARK:
+      case LEFT:
+        temporaryCorDefOutputs.putAll(leftUnnestedQuery.corDefOutputs);
+        break;
+      case RIGHT:
+        rightUnnestedQuery.corDefOutputs.forEach((corDef, index) ->
             temporaryCorDefOutputs.put(corDef, index + newLeftFieldCount));
-      } else {
-        throw new IllegalArgumentException("The UnnestInfo for both sides of Join/Correlate that "
-            + "has correlation should not all be empty.");
+        break;
+      case FULL:
+        RexBuilder rexBuilder = builder.getRexBuilder();
+        for (CorDef corDef : corDefs) {
+          int leftIndex = requireNonNull(leftUnnestedQuery.corDefOutputs.get(corDef));
+          int rightIndex = requireNonNull(rightUnnestedQuery.corDefOutputs.get(corDef));
+          RexNode coalesce = rexBuilder.makeCall(
+              SqlStdOperatorTable.COALESCE,
+              rexBuilder.makeInputRef(temporaryNewRel, leftIndex),
+              rexBuilder.makeInputRef(temporaryNewRel, rightIndex + newLeftFieldCount));
+          temporaryCorDefToCoalesce.put(corDef, coalesce);
+        }
+        break;
+      case INNER:
+        if (!leftUnnestedQuery.corDefOutputs.isEmpty()) {
+          temporaryCorDefOutputs.putAll(leftUnnestedQuery.corDefOutputs);
+        } else {
+          rightUnnestedQuery.corDefOutputs.forEach((corDef, index) ->
+              temporaryCorDefOutputs.put(corDef, index + newLeftFieldCount));
+        }
+        break;
+      default:
+        throw new UnsupportedOperationException("Unsupported join type : " + joinRelType);
       }
-      RelNode temporaryOldRel = builder.push(leftInfo.oldRel).push(rightInfo.oldRel)
-          .join(JoinRelType.INNER)
-          .build();
-      RelNode temporaryNewRel = builder.push(leftInfo.r).push(rightInfo.r)
-          .join(JoinRelType.INNER)
-          .build();
-      UnnestedQuery temporaryInfo =
+
+      UnnestedQuery temporaryUnnestedQuery =
           new UnnestedQuery(temporaryOldRel, temporaryNewRel,
               temporaryCorDefOutputs, temporaryOldToNewOutputs);
-      RexNode rewriteOriCondition = CorrelatedExprRewriter.rewrite(oriCondition, temporaryInfo);
+      RexNode rewriteOriCondition =
+          CorrelatedExprRewriter.rewriteJoinCondition(oriCondition, temporaryUnnestedQuery,
+              joinRelType == JoinRelType.FULL, temporaryCorDefToCoalesce);
       List<RexNode> unnestedJoinConditions = new ArrayList<>();
       unnestedJoinConditions.add(rewriteOriCondition);
 
       if (needNaturalJoinCondition) {
         for (CorDef corDef : corDefs) {
-          int leftIndex = requireNonNull(leftInfo.corDefOutputs.get(corDef));
+          int leftIndex = requireNonNull(leftUnnestedQuery.corDefOutputs.get(corDef));
           RelDataType leftColumnType
-              = leftInfo.r.getRowType().getFieldList().get(leftIndex).getType();
-          int rightIndex = requireNonNull(rightInfo.corDefOutputs.get(corDef));
+              = leftUnnestedQuery.r.getRowType().getFieldList().get(leftIndex).getType();
+          int rightIndex = requireNonNull(rightUnnestedQuery.corDefOutputs.get(corDef));
           RelDataType rightColumnType
-              = rightInfo.r.getRowType().getFieldList().get(rightIndex).getType();
+              = rightUnnestedQuery.r.getRowType().getFieldList().get(rightIndex).getType();
           RexNode notDistinctFrom =
               builder.isNotDistinctFrom(
                   new RexInputRef(leftIndex, leftColumnType),
