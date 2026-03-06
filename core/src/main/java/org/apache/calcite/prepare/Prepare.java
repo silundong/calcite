@@ -256,6 +256,8 @@ public abstract class Prepare {
 
     RelRoot root =
         sqlToRelConverter.convertQuery(sqlQuery, needsValidation, true);
+    System.out.println("========init==========");
+    System.out.println(RelOptUtil.toString(root.rel));
     if (this.context.config().conformance().checkedArithmetic()) {
       ConvertToChecked checkedConv = new ConvertToChecked(root.rel.getCluster().getRexBuilder());
       RelNode rel = checkedConv.visit(root.rel);

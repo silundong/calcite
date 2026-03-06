@@ -541,6 +541,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
         LOGGER.debug("Provenance:\n{}", Dumpers.provenance(provenanceMap, cheapest));
       }
     }
+    System.out.println(RelOptUtil.toString(cheapest));
     return cheapest;
   }
 
